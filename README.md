@@ -61,3 +61,20 @@ To set it to `US`:
 ```sh
 sudo iw reg set US
 ```
+
+To set it permanently:
+
+```sh
+sudo nano /etc/conf.d/wireless-regdom
+```
+
+and then change
+```
+#WIRELESS_REGDOM="US"
+
+to
+
+WIRELESS_REGDOM="US"
+
+and press ctrl+x to save and exit from nano
+```
