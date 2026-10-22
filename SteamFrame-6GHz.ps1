@@ -3,10 +3,8 @@
 # Protocol packet derived from toorux/steam-frame-6ghz-tool src/protocol.rs.
 # WARNING: WlanIhvControl transport compatibility with this specific Realtek firmware
 # has not been tested on hardware. A failed call is NOT evidence the driver is unsupported.
-# Run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\SteamFrame-6GHz.ps1
-# To apply once: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\SteamFrame-6GHz.ps1 -ApplyUS
 param([switch]$ApplyUS, [switch]$Force)
-$ErrorActionPreference='Stop'
+$ErrorActionPreference = 'Stop'
 if (-not [Environment]::Is64BitProcess) { throw 'Run with 64-bit PowerShell.' }
 if ($ApplyUS -and -not $Force) {
   $answer = Read-Host 'This submits ONE vendor command to set the adapter runtime country to US. Type APPLY to continue'
@@ -26,14 +24,47 @@ public static class FrameWlan {
 }
 '@
 Add-Type -TypeDefinition $source -ErrorAction Stop
-$adapter = Get-NetAdapter -Name 'Wi-Fi' -ErrorAction Stop
-if ($adapter.InterfaceDescription -notmatch 'Realtek 8832CU.*Valve') {
-  throw "Refusing to target unexpected adapter: $($adapter.InterfaceDescription)"
+
+# Select the Steam Frame network interface by its Valve USB hardware ID.
+# Do not rely on its Windows connection name (Wi-Fi, Wi-Fi 2, Ethernet, etc.).
+$steamFramePnpPrefix = 'USB\VID_28DE&PID_2432\'
+$frameDevices = @(
+  Get-CimInstance -ClassName Win32_NetworkAdapter -ErrorAction Stop |
+    Where-Object {
+      $_.PNPDeviceID -and
+      $_.PNPDeviceID.StartsWith($steamFramePnpPrefix, [StringComparison]::OrdinalIgnoreCase)
+    }
+)
+if ($frameDevices.Count -eq 0) {
+  throw "Could not find a network adapter with PnP ID starting '$steamFramePnpPrefix'. No command was sent."
+}
+if ($frameDevices.Count -gt 1) {
+  $ids = ($frameDevices | ForEach-Object { "Name='$($_.NetConnectionID)' Description='$($_.Name)' PNP='$($_.PNPDeviceID)'" }) -join '; '
+  throw "Found multiple network adapters matching the Steam Frame USB ID; refusing to guess: $ids"
+}
+$frameDevice = $frameDevices[0]
+if ([string]::IsNullOrWhiteSpace([string]$frameDevice.GUID)) {
+  throw "The Steam Frame PnP device was found ('$($frameDevice.Name)'), but Windows did not expose its network interface GUID. No command was sent."
+}
+$frameGuid = [Guid]::Parse([string]$frameDevice.GUID)
+$matchingAdapters = @(
+  Get-NetAdapter -IncludeHidden -ErrorAction Stop |
+    Where-Object {
+      try { [Guid]::Parse([string]$_.InterfaceGuid) -eq $frameGuid } catch { $false }
+    }
+)
+if ($matchingAdapters.Count -ne 1) {
+  throw "Found the Steam Frame PnP device '$($frameDevice.Name)' but matched $($matchingAdapters.Count) Get-NetAdapter entries by GUID. No command was sent."
+}
+$adapter = $matchingAdapters[0]
+if ([string]::IsNullOrWhiteSpace([string]$adapter.InterfaceGuid)) {
+  throw 'Selected adapter has no interface GUID. No command was sent.'
 }
 $guid = [Guid]::Parse($adapter.InterfaceGuid.ToString())
-$negotiated=[uint32]0
-$h=[IntPtr]::Zero
-$err=[FrameWlan]::WlanOpenHandle(2,[IntPtr]::Zero,[ref]$negotiated,[ref]$h)
+
+$negotiated = [uint32]0
+$h = [IntPtr]::Zero
+$err = [FrameWlan]::WlanOpenHandle(2, [IntPtr]::Zero, [ref]$negotiated, [ref]$h)
 if ($err -ne 0) { throw "WlanOpenHandle failed: Win32 error $err" }
 function Packet([string]$kind) {
   $b = [Collections.Generic.List[byte]]::new()
@@ -47,9 +78,9 @@ function Packet([string]$kind) {
   }
   if ($kind -in @('Info','ManualUS')) {
     foreach ($n in @(0,0, $(if($kind -eq 'ManualUS'){29}else{0}),3)) { $b.AddRange([BitConverter]::GetBytes([uint32]$n)) }
-    $tokens=if($kind -eq 'ManualUS') { @('67','US') } else { @('echo','core','6g_info') }
+    $tokens = if($kind -eq 'ManualUS') { @('67','US') } else { @('echo','core','6g_info') }
     foreach($token in $tokens) {
-      $bytes=[Text.Encoding]::ASCII.GetBytes($token)
+      $bytes = [Text.Encoding]::ASCII.GetBytes($token)
       $b.AddRange($bytes)
       for($i=$bytes.Length;$i -lt 16;$i++){ $b.Add([byte]0) }
     }
@@ -57,10 +88,9 @@ function Packet([string]$kind) {
   } else {
     while($b.Count -lt 300) { $b.Add([byte]0) }
   }
-  $n=[uint32]$b.Count
-  $p=[Collections.Generic.List[byte]]::new()
-  # Parenthesize arithmetic: Windows PowerShell 5.1 otherwise treats comma-separated
-  # expressions such as $n+36,VALUE as array addition (Object[].op_Addition).
+  $n = [uint32]$b.Count
+  $p = [Collections.Generic.List[byte]]::new()
+  # Parenthesize arithmetic for Windows PowerShell 5.1 compatibility.
   $headerWords = @(
     ($n + 36),
     2169298944,
@@ -73,76 +103,74 @@ function Packet([string]$kind) {
     ($n + 24),
     $n
   )
-  foreach($x in $headerWords) {
-    $p.AddRange([BitConverter]::GetBytes([uint32]$x))
-  }
+  foreach($x in $headerWords) { $p.AddRange([BitConverter]::GetBytes([uint32]$x)) }
   $p.AddRange($b)
   return ,$p.ToArray()
 }
 function Exchange([string]$kind) {
-  [byte[]]$req=Packet $kind
-  $resp=New-Object byte[] $req.Length
-  $returned=[uint32]0
-  # Driver control type 1; if this vendor's transport uses an alternate method, this will fail.
-  $code=[FrameWlan]::WlanIhvControl($h,[ref]$guid,1,[uint32]$req.Length,$req,[uint32]$resp.Length,$resp,[ref]$returned)
+  [byte[]]$req = Packet $kind
+  $resp = New-Object byte[] $req.Length
+  $returned = [uint32]0
+  $code = [FrameWlan]::WlanIhvControl($h, [ref]$guid, 1, [uint32]$req.Length, $req, [uint32]$resp.Length, $resp, [ref]$returned)
   if ($code -ne 0) { throw "WlanIhvControl($kind) failed: Win32 error $code" }
   if ($returned -lt 40 -or $returned -gt $resp.Length) { throw "Invalid reply length for $kind ($returned)" }
-  for($i=0;$i -lt 28;$i++) { if($req[$i] -ne $resp[$i]) {throw "Protocol header mismatch: $kind"} }
-  for($i=36;$i -lt 40;$i++) { if($req[$i] -ne $resp[$i]) {throw "Protocol length mismatch: $kind"} }
-  $written=[BitConverter]::ToUInt32($resp,28)
-  $status=[BitConverter]::ToUInt32($resp,32)
-  $capacity=[BitConverter]::ToUInt32($resp,36)
-  if ($status -ne 0 -or $written -gt $capacity -or (40+$written) -gt $returned) {throw "Driver did not confirm valid $kind reply"}
-  $out=New-Object byte[] ([int]$written)
-  [Array]::Copy($resp,40,$out,0,[int]$written)
+  for($i=0;$i -lt 28;$i++) { if($req[$i] -ne $resp[$i]) { throw "Protocol header mismatch: $kind" } }
+  for($i=36;$i -lt 40;$i++) { if($req[$i] -ne $resp[$i]) { throw "Protocol length mismatch: $kind" } }
+  $written = [BitConverter]::ToUInt32($resp, 28)
+  $status = [BitConverter]::ToUInt32($resp, 32)
+  $capacity = [BitConverter]::ToUInt32($resp, 36)
+  if ($status -ne 0 -or $written -gt $capacity -or (40 + $written) -gt $returned) { throw "Driver did not confirm valid $kind reply" }
+  $out = New-Object byte[] ([int]$written)
+  [Array]::Copy($resp, 40, $out, 0, [int]$written)
   return ,$out
 }
 function Country {
-  [byte[]]$x=Exchange 'Country'
-  if($x.Length -ne 2) {throw 'Unexpected country reply length'}
-  if($x[0] -eq 0 -and $x[1] -eq 0){return 'unknown (two zero bytes)'}
+  [byte[]]$x = Exchange 'Country'
+  if($x.Length -ne 2) { throw 'Unexpected country reply length' }
+  if($x[0] -eq 0 -and $x[1] -eq 0) { return 'unknown (two zero bytes)' }
   return [Text.Encoding]::ASCII.GetString($x)
 }
 function Diagnostic([string]$kind) {
   [void](Exchange 'Done') # consume stale completion
-  [void](Exchange $kind)   # exactly ONE submission, no retry
-  $ready=$false
+  [void](Exchange $kind)  # exactly ONE submission, no retry
+  $ready = $false
   for($i=0;$i -lt 20;$i++) {
     Start-Sleep -Milliseconds 100
-    [byte[]]$d=Exchange 'Done'
-    if($d.Length -ne 4){throw 'Unexpected Done reply'}
-    $state=[BitConverter]::ToUInt32($d,0)
-    if($state -gt 1){throw 'Unexpected Done state'}
-    if($state -eq 1){$ready=$true;break}
+    [byte[]]$d = Exchange 'Done'
+    if($d.Length -ne 4) { throw 'Unexpected Done reply' }
+    $state = [BitConverter]::ToUInt32($d, 0)
+    if($state -gt 1) { throw 'Unexpected Done state' }
+    if($state -eq 1) { $ready = $true; break }
   }
-  if(-not $ready){throw 'Timed out; command was NOT resent. State is unknown.'}
-  $full=[Collections.Generic.List[byte]]::new()
-  $sequence=$null
+  if(-not $ready) { throw 'Timed out; command was NOT resent. State is unknown.' }
+  $full = [Collections.Generic.List[byte]]::new()
+  $sequence = $null
   for($i=0;$i -lt 64;$i++) {
-    [byte[]]$part=Exchange 'Output'
-    if($part.Length -lt 16){throw 'Truncated output block'}
-    $mode=[BitConverter]::ToUInt32($part,0)
-    $status=[BitConverter]::ToUInt32($part,4)
-    $seq=[BitConverter]::ToUInt32($part,8)
-    $len=[BitConverter]::ToUInt32($part,12)
-    if($mode -ne 0 -or $status -notin @(0,2) -or $len -gt 200 -or $part.Length -ne (16+$len)){throw 'Invalid output block'}
-    if($null -ne $sequence -and $seq -ne $sequence){throw 'Output sequence changed'}
-    $sequence=$seq
-    for($j=16;$j -lt $part.Length;$j++){$full.Add($part[$j])}
-    if($full.Contains([byte]0) -or $status -eq 0){
-      $bytes=$full.ToArray()
-      $idx=[Array]::IndexOf($bytes,[byte]0)
-      if($idx -eq 0){$bytes=[byte[]]@()} elseif($idx -gt 0){$bytes=$bytes[0..($idx-1)]}
-      return [Text.Encoding]::ASCII.GetString($bytes).Replace("`r",'')
+    [byte[]]$part = Exchange 'Output'
+    if($part.Length -lt 16) { throw 'Truncated output block' }
+    $mode = [BitConverter]::ToUInt32($part, 0)
+    $status = [BitConverter]::ToUInt32($part, 4)
+    $seq = [BitConverter]::ToUInt32($part, 8)
+    $len = [BitConverter]::ToUInt32($part, 12)
+    if($mode -ne 0 -or $status -notin @(0,2) -or $len -gt 200 -or $part.Length -ne (16 + $len)) { throw 'Invalid output block' }
+    if($null -ne $sequence -and $seq -ne $sequence) { throw 'Output sequence changed' }
+    $sequence = $seq
+    for($j=16;$j -lt $part.Length;$j++) { $full.Add($part[$j]) }
+    if($full.Contains([byte]0) -or $status -eq 0) {
+      $bytes = $full.ToArray()
+      $idx = [Array]::IndexOf($bytes, [byte]0)
+      if($idx -eq 0) { $bytes = [byte[]]@() } elseif($idx -gt 0) { $bytes = $bytes[0..($idx-1)] }
+      return [Text.Encoding]::ASCII.GetString($bytes).Replace("`r", '')
     }
   }
   throw 'Diagnostic output exceeded limit'
 }
 try {
-  Write-Host "Target: $($adapter.InterfaceDescription) / $guid"
+  Write-Host "Target: $($adapter.Name) [$($adapter.InterfaceDescription)] / $guid"
+  Write-Host "Matched USB device: $($frameDevice.PNPDeviceID)"
   if ($ApplyUS) {
     Write-Host 'Submitting one-time US runtime command...'
-    $reply=Diagnostic 'ManualUS'
+    $reply = Diagnostic 'ManualUS'
     Write-Host "Driver reply:`n$reply"
     if ($reply -notmatch 'Country code has changed to US|Invalid country code!') {
       Write-Warning 'Unexpected reply. Do not automatically retry.'
@@ -152,5 +180,5 @@ try {
   Write-Host "6 GHz diagnostic output:`n$(Diagnostic 'Info')"
   Write-Host 'Done. No registry, driver files, or startup tasks changed.'
 } finally {
-  [void][FrameWlan]::WlanCloseHandle($h,[IntPtr]::Zero)
+  [void][FrameWlan]::WlanCloseHandle($h, [IntPtr]::Zero)
 }
